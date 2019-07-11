@@ -1,0 +1,156 @@
+* 异步I/O和延迟文件读取
+    *  介绍
+    *  设置:用回调覆盖FMOD的文件系统
+    *  定义基本操作—打开和关闭文件句柄
+    *  定义“userasyncread”
+    *  定义“userasynccancel”
+    *  执行延迟读取时填充FMOD_ASYNCREADINFO结构
+        * 最后设置结果!
+    * 线程问题&读取优先级
+
+
+#### 介绍
+本教程将描述如何在FMOD中延迟文件读取，这样您就不必立即满足FMOD对数据的请求。
+这种行为在还没有访问数据的游戏流媒体引擎中是非常可取的，或者当访问数据时出现顺序错误或以非顺序的方式访问将会大大降低性能。
+
+FMOD的异步I/O回调将允许您接收一个FMOD读请求，并将其推迟到稍后游戏准备好时。FMOD将使用优先级来通知游戏引擎读取请求的紧急程度，因为有时延迟读取音乐流可能会导致音频断断续续。
+
+
+#### 设置:用回调覆盖FMOD的文件系统
+其思想是，您希望覆盖FMOD通常在内部执行的文件I/O。您以前可能在System::setFileSystem中这样做过，方法是覆盖以下回调:
+
+```
+FMOD_FILE_OPENCALLBACK  useropen
+FMOD_FILE_CLOSECALLBACK  userclose
+FMOD_FILE_READCALLBACK  userread
+FMOD_FILE_SEEKCALLBACK  userseek
+```
+
+这里的正常行为是，您需要以阻塞的方式立即满足FMOD的读取和查找请求。  
+在open回调函数中，打开内部文件句柄并将其连同文件大小返回给FMOD。  
+您必须设置所有回调，否则文件系统覆盖将不起作用。上面回调列表中任何为空的回调都会导致FMOD使用默认的内部系统并忽略回调。必须设置所有回调。  
+使用async I/O，有两个新的回调，你可以用它来代替'userread'和'userseek'回调:
+
+```
+FMOD_FILE_ASYNCREADCALLBACK  userasyncread
+FMOD_FILE_ASYNCCANCELCALLBACK  userasynccancel
+```
+如果设置了这些回调，则会使“userread”和“userseek”回调变得多余。当然，如果出于某种原因希望在两个系统之间切换，可以定义“userread”和“userseek”，但是当定义“userasyncread”时，将永远不会调用正常的read/seek回调。
+
+
+#### 定义基本操作—打开和关闭文件句柄
+在开始之前，我们将定义open和close回调函数。下面提供了一个使用stdio的非常简单的实现:
+
+```
+FMOD_RESULT F_CALLBACK myopen(const char *name, unsigned int *filesize, void **handle, void **userdata)
+{
+    if (name)
+    {
+        FILE *fp;
+
+        fp = fopen(name, "rb");
+        if (!fp)
+        {
+            return FMOD_ERR_FILE_NOTFOUND;
+        }
+
+        fseek(fp, 0, SEEK_END);
+        *filesize = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+
+        *userdata = (void *)0x12345678;
+        *handle = fp;
+    }
+
+    return FMOD_OK;
+}
+
+FMOD_RESULT F_CALLBACK myclose(void *handle, void *userdata)
+{
+    if (!handle)
+    {
+        return FMOD_ERR_INVALID_PARAM;
+    }
+
+    fclose((FILE *)handle);
+
+    return FMOD_OK;
+}
+```
+
+####  定义“userasyncread”
+异步读取的想法是，FMOD将请求数据(注意，可能是从任何线程请求的——所以要注意代码中的线程安全!)，但不必立即将数据提供给FMOD。您可以从回调函数返回，而不需要给FMOD任何数据。这是递延的I/O。
+
+例如，下面是异步读回调的定义:
+
+```
+FMOD_RESULT F_CALLBACK myasyncread(FMOD_ASYNCREADINFO *info, void *userdata)
+{
+    return PutReadRequestOntoQueue(info);
+}
+```
+注意，我们实际上没有做任何阅读。您可以立即返回，FMOD将在内部等待，直到读取请求得到满足。注意，如果FMOD决定从主线程等待(它经常这样做)，那么您不能满足主线程的队列，您将会得到死锁。只需将请求放到队列中。我们将在下一节讨论如何让FMOD知道数据已经准备好了。
+这里有几件事需要考虑:  
+* 回调可以来自FMOD系统中的任何线程。通常这意味着FMOD的流线程、FMOD的文件I/O线程、主线程或FMOD_NONBLOCKING线程。是线程安全的。在链表/队列操作周围使用criticalsection，以避免数据损坏。
+* 返回代码。这通常是一个致命的、与磁盘无关的错误，比如无法添加到队列。例如，这可能是内存不足。如果是这种情况，使用FMOD_ERR_MEMORY作为返回值。在正常情况下返回FMOD_OK。它通常不会是与磁盘错误相关的返回代码。您必须在FMOD_ASYNCREADINFO结构中设置“result”代码，以便FMOD知道基于文件的错误。
+* 请注意，如果用户决定释放正在使用该文件的FMOD资源(比如声音)，则可能需要取消排队命令。在这种情况下，请参阅下一节关于myasynccancel的内容。
+* FMOD_ASYNCREADINFO结构是您填写FMOD请求的数据的地方。有关此结构的更详细描述，以及完成阅读所需的内容，请参见下面。
+
+
+####  定义“userasynccancel”
+
+如果您已经排好了许多读请求的队列，但还没有满足它们，那么用户可能希望在请求完成之前释放一个声音(即调用sound::release)。
+
+在这种情况下，FMOD将调用async cancel回调函数，让您取消与此文件相关的任何挂起的操作。
+
+
+```
+FMOD_RESULT F_CALLBACK myasynccancel(void *handle, void *userdata)
+{
+    return SearchQueueForFileHandleAndRemove(info);
+}
+```
+注意，上面的回调实现将搜索我们的内部链表(以线程安全的方式)，从队列中删除任何请求，这样它们就不会在声音释放后被处理。如果它正在读取过程中，那么回调函数将等待读取完成，然后返回。
+在读取发生时或读取发生之前不要返回，因为读取目标的内存将被释放，延迟的读取将读入无效指针。
+
+
+#### 执行延迟读取时填充FMOD_ASYNCREADINFO结构
+FMOD_ASYNCREADINFO是您将传递给延迟I/O系统的结构，也是您在完成请求时读取和填写的结构。该结构公开了异步读取系统的特性。这些都是:
+* 优先支持。FMOD将让用户知道读取的内容是否不重要、是否稍微重要或是否非常重要。这将允许用户重新洗牌队列，使重要的读取发生在不重要的读取之前。
+* 读取完成通过简单地设置FMOD_ASYNCREADINFO的“result”代码来表示。
+* 内存不需要复制到任何地方，您可以直接读入FMOD的指针，这些指针直接指向内部文件缓冲区。
+* 您不需要给FMOD所有的数据，您可以给回调函数一个部分读取结果，FMOD很可能稍后只发出另一个读取请求，其字节值更小。
+
+
+```
+typedef struct {
+  void *  handle;
+  unsigned int  offset;
+  unsigned int  sizebytes;
+  int  priority;
+  void *  buffer;
+  unsigned int  bytesread;
+  FMOD_RESULT  result;
+  void *  userdata;
+} FMOD_ASYNCREADINFO;
+```
+前4个成员(句柄、偏移量、sizebytes、优先级)是只读值，它告诉您有关文件句柄的信息、它想从文件的哪个位置读取(所以不需要查找回调!)以及它想要多少字节。priority值告诉您读取的重要性，如前所述。
+接下来的3个成员(buffer、bytesread和result)是您要填写的值，并让FMOD知道您已经读取了数据。
+将文件数据读入缓冲区。sizebytes是您应该读取的大小。bytesread是实际读取的量(可能小于sizebytes)。
+如果您遇到“文件结束”条件，并且需要返回的字节数小于请求的字节数—将bytesread设置为小于sizebytes，然后将结果设置为FMOD_ERR_FILE_EOF。
+
+##### 最后设置结果!
+注意!在设置bytesread值并将数据读入缓冲区之前，不要设置结果。
+result的初值为FMOD_ERR_NOTREADY。当您将值设置为FMOD_OK(或适当的错误代码)时，FMOD内部将立即将其视为继续执行的指示，因此，如果bytesread或缓冲区内容还没有准备好，您将得到损坏、错误或意外行为。
+总之，在完成队列处理之前，您要做的最后一件事是设置结果。在设置bytesread或填充缓冲区之前，不会设置它。
+
+#### 线程问题&读取优先级
+正如本教程前面提到的，FMOD可以从不同的线程调用read回调，因此保护I/O系统不受不同线程同时执行的操作的影响是一种常识。   
+使用FMOD异步I/O特性的系统很可能在自己的线程中运行。这就是为什么FMOD加载调用中的阻塞等待循环不会永远等待数据，因为用户不能将数据提供给FMOD。   
+如果系统在另一个线程中运行，它可以检测队列插入，并在FMOD等待时处理数据。  
+实际上，可以像没有延迟一样完成读取，并直接将文件读入缓冲区，并从FMOD async read回调中设置sizebytes/result值。这是减少非常紧急的FMOD读取延迟的一种可能方法。  
+
+目前有3种不同类别的读取优先级。
+* 0 =低优先级。这些读取通常是来自用户load命令的阻塞式读取，除了load函数花费更长的时间外，延迟读取没有真正的负面影响。例如，这些读取将从System::createSound调用发出。
+* 50 =中等优先级。这些读取非常重要，通常来自FMOD流系统。他们可以推迟，但不能拖太久。如果延迟太长，则音频流将会饿死，并可能出现口吃。如果需要延长读取时间，可以使用System::setStreamBufferSize增加FMOD文件缓冲区大小
+* 100 =高优先级。当前FMOD发出的最高优先级读取是当音频流循环时。它必须在循环开始后内部刷新流缓冲区，并在流“解码缓冲区”(流解码器解码成的PCM双缓冲区)循环并开始结巴(这是与前面提到的流缓冲区不同的缓冲区)之前这样做。其中一个包含压缩文件数据。解码缓冲区包含解压后的PCM数据)。解码缓冲区通常很小，因此快速读取非常重要，但是用户也可以使用FMOD_CREATESOUNDEXINFO::decodebuffersize增加这些缓冲区。FMOD_ADVANCEDSETTINGS: defaultDecodeBufferSize也可以用来设置所有未来解码缓冲区大小对所有流,而无需每次都把它,和将被用于事件系统解码缓冲区大小不是因为你可以设置单独的事件。
